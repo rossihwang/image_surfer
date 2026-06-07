@@ -38,3 +38,6 @@ class ImageListModel(QAbstractListModel):
         if 0 <= row < len(self._files):
             return self._files[row]
         return None
+
+    def file_paths(self) -> list[str]:
+        return [str(p) for p in self._files]

@@ -11,13 +11,14 @@ from PySide6.QtCore import QObject, Signal
 
 _MODEL = None
 _PREPROCESS = None
+_TOKENIZER = None
 _DEVICE = None
 
 
 def _load_model():
-    global _MODEL, _PREPROCESS, _DEVICE
+    global _MODEL, _PREPROCESS, _TOKENIZER, _DEVICE
     if _MODEL is not None:
-        return _MODEL, _PREPROCESS, _DEVICE
+        return _MODEL, _PREPROCESS, _DEVICE, _TOKENIZER
 
     import open_clip
 
@@ -27,10 +28,11 @@ def _load_model():
     )
     model = model.to(_DEVICE)
     model.eval()
+    _TOKENIZER = open_clip.get_tokenizer("MobileCLIP2-S0")
 
     _MODEL = model
     _PREPROCESS = preprocess
-    return _MODEL, _PREPROCESS, _DEVICE
+    return _MODEL, _PREPROCESS, _DEVICE, _TOKENIZER
 
 
 class IndexWorker(QObject):
@@ -56,7 +58,7 @@ class IndexWorker(QObject):
             return
 
         try:
-            model, preprocess, device = _load_model()
+            model, preprocess, device, _ = _load_model()
         except Exception as e:
             self.error.emit(f"Failed to load model: {e}")
             return

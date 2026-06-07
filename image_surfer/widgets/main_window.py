@@ -3,12 +3,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QModelIndex, QSettings, Qt, QThread
+from PySide6.QtCore import QEvent, QModelIndex, QSettings, Qt, QSortFilterProxyModel, QThread
 from PySide6.QtGui import QAction, QKeyEvent, QPixmap
 from PySide6.QtWidgets import (
     QFileDialog,
+    QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QListView,
     QMainWindow,
     QMenu,
@@ -57,6 +59,25 @@ class _WrappingListView(QListView):
         super().keyPressEvent(event)
 
 
+class _TextFilterProxy(QSortFilterProxyModel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._allowed: set[str] | None = None
+
+    def set_allowed(self, paths: list[str] | None):
+        self._allowed = set(paths) if paths else None
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row, source_parent):
+        if self._allowed is None:
+            return True
+        m = self.sourceModel()
+        if hasattr(m, "file_at"):
+            p = m.file_at(source_row)
+            return str(p) in self._allowed if p else False
+        return True
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -74,13 +95,32 @@ class MainWindow(QMainWindow):
         self._settings = QSettings("ImageSurfer", "ImageSurfer")
 
         self._model = ImageListModel()
+        self._proxy = _TextFilterProxy()
+        self._proxy.setSourceModel(self._model)
 
         self._list_view = QListView()
-        self._list_view.setModel(self._model)
+        self._list_view.setModel(self._proxy)
         self._list_view.setSelectionMode(QListView.SingleSelection)
         self._list_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self._list_view.customContextMenuRequested.connect(self._show_context_menu)
         self._list_view.selectionModel().currentChanged.connect(self._on_selection_changed)
+
+        self._search_input = QLineEdit()
+        self._search_input.setPlaceholderText("Search images by text\u2026")
+        self._search_input.returnPressed.connect(self._on_search_return)
+
+        self._search_input.installEventFilter(self)
+
+        search_clear_btn = QToolButton()
+        search_clear_btn.setText("\u00d7")
+        search_clear_btn.setStyleSheet("border: none; padding: 2px 6px;")
+        search_clear_btn.clicked.connect(self._clear_text_search)
+
+        search_bar = QWidget()
+        search_layout = QHBoxLayout(search_bar)
+        search_layout.setContentsMargins(4, 0, 4, 0)
+        search_layout.addWidget(self._search_input)
+        search_layout.addWidget(search_clear_btn)
 
         refresh_btn = QToolButton()
         refresh_btn.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
@@ -92,6 +132,7 @@ class MainWindow(QMainWindow):
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(0)
         left_layout.addWidget(self._list_view)
+        left_layout.addWidget(search_bar)
         left_layout.addWidget(refresh_btn)
 
         self._result_model = SearchResultModel()
@@ -165,6 +206,12 @@ class MainWindow(QMainWindow):
 
         self.addToolBar(toolbar)
 
+    def _source_path(self, proxy_index: QModelIndex) -> Path | None:
+        if not proxy_index.isValid():
+            return None
+        src = self._proxy.mapToSource(proxy_index)
+        return self._model.file_at(src.row())
+
     def _open_folder(self):
         dir_path = QFileDialog.getExistingDirectory(self, "Open Image Folder")
         if dir_path:
@@ -172,13 +219,47 @@ class MainWindow(QMainWindow):
             self._model.load_directory(self._current_directory)
             self._update_index_status()
             self._close_results()
+            self._clear_text_search()
             if self._model.rowCount() > 0:
-                self._list_view.setCurrentIndex(self._model.index(0, 0))
+                self._list_view.setCurrentIndex(self._proxy.index(0, 0))
 
     def _refresh(self):
         if self._current_directory:
             self._model.load_directory(self._current_directory)
             self._update_index_status()
+
+    def _on_search_return(self):
+        text = self._search_input.text().strip()
+        if not text:
+            return
+        if not self._current_directory:
+            return
+
+        cache_dir = self._current_directory / ".imagesurfer"
+        if not (cache_dir / "index.faiss").exists():
+            self._status_bar.showMessage("Index not found. Build index first.")
+            return
+
+        self._search_thread = QThread()
+        self._search_worker = SearchWorker()
+        self._search_worker.moveToThread(self._search_thread)
+
+        self._search_worker.finished.connect(self._on_text_search_finished)
+        self._search_worker.error.connect(self._on_search_error)
+        self._search_thread.finished.connect(self._cleanup_search)
+
+        self._search_thread.started.connect(
+            lambda: self._search_worker.text_search(
+                str(self._current_directory), text, 50
+            )
+        )
+
+        self._status_bar.showMessage("Searching\u2026")
+        self._search_thread.start()
+
+    def _clear_text_search(self):
+        self._search_input.clear()
+        self._proxy.set_allowed(None)
 
     def _build_index(self):
         if not self._current_directory:
@@ -258,6 +339,7 @@ class MainWindow(QMainWindow):
             "\u2022 Scroll wheel to zoom in/out\n"
             "\u2022 Right-click to open with system viewer\n"
             "\u2022 Right-click \u2192 Find Similar for image search\n"
+            "\u2022 Type in the search bar \u2192 Enter for text search\n"
             "\u2022 File > Open to browse images",
         )
 
@@ -265,7 +347,7 @@ class MainWindow(QMainWindow):
         index = self._list_view.indexAt(pos)
         if not index.isValid():
             return
-        file_path = self._model.file_at(index.row())
+        file_path = self._source_path(index)
         if not file_path:
             return
 
@@ -344,6 +426,16 @@ class MainWindow(QMainWindow):
         self._search_thread.quit()
         self._status_bar.showMessage(f"Search failed: {msg}")
 
+    def _on_text_search_finished(self, results):
+        self._search_thread.quit()
+        paths = [p for _, p in results]
+        self._proxy.set_allowed(paths)
+        self._status_bar.showMessage(
+            f"Text search: {len(results)} results \u2014 ESC to clear"
+        )
+        if self._proxy.rowCount() > 0:
+            self._list_view.setCurrentIndex(self._proxy.index(0, 0))
+
     def _cleanup_search(self):
         self._search_thread.wait()
         self._search_thread.deleteLater()
@@ -369,11 +461,11 @@ class MainWindow(QMainWindow):
         self._close_results()
         if not current.isValid():
             return
-        file_path = self._model.file_at(current.row())
+        file_path = self._source_path(current)
         if file_path:
             self._current_seq += 1
             self._loader.load(str(file_path), self._current_seq)
-            self._update_status(current.row())
+            self._update_status(current)
 
     def _on_image_loaded(self, pixmap, path, seq):
         if seq != self._current_seq:
@@ -401,17 +493,19 @@ class MainWindow(QMainWindow):
             '<span style="color:#cc6600;font-weight:bold;">\u2717 Not indexed</span>'
         )
 
-    def _update_status(self, row: int):
+    def _update_status(self, proxy_index: QModelIndex):
         total = self._model.rowCount()
-        file_path = self._model.file_at(row)
+        file_path = self._source_path(proxy_index)
         if file_path:
-            self._status_bar.showMessage(f"{row + 1} / {total} \u2014 {file_path.name}")
+            self._status_bar.showMessage(
+                f"{proxy_index.row() + 1} / {total} \u2014 {file_path.name}"
+            )
 
     def keyPressEvent(self, event: QKeyEvent):
-        if event.key() == Qt.Key_Up:
-            self._navigate(-1)
-        elif event.key() == Qt.Key_Down:
+        if event.key() == Qt.Key_Down:
             self._navigate(1)
+        elif event.key() == Qt.Key_Up:
+            self._navigate(-1)
         else:
             super().keyPressEvent(event)
 
@@ -420,8 +514,15 @@ class MainWindow(QMainWindow):
         if not current.isValid():
             return
         new_row = current.row() + delta
-        if 0 <= new_row < self._model.rowCount():
-            self._list_view.setCurrentIndex(self._model.index(new_row, 0))
+        if 0 <= new_row < self._proxy.rowCount():
+            self._list_view.setCurrentIndex(self._proxy.index(new_row, 0))
+
+    def eventFilter(self, obj, event):
+        if obj is self._search_input and event.type() == QEvent.KeyPress:
+            if event.key() == Qt.Key_Escape:
+                self._clear_text_search()
+                return True
+        return super().eventFilter(obj, event)
 
     def closeEvent(self, event):
         self._settings.setValue("geometry", self.saveGeometry())
